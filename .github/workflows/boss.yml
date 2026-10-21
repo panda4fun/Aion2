@@ -3,11 +3,17 @@ name: boss-notifier
 on:
   schedule:
     - cron: "*/5 * * * *"     # раз в 5 минут (GitHub может задерживать запуск)
-  workflow_dispatch:           # кнопка ручного запуска
+  workflow_dispatch:           # кнопка ручного запуска и перезапуск самого себя
 
+# Каждый запуск в конце запускает следующий, cron нужен как страховка, если цепочка оборвётся.
+# Лишние запуски в очереди GitHub отменяет сам: ждать может только один.
 concurrency:
   group: boss-notifier
   cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write               # чтобы запустить следующий запуск
 
 jobs:
   notify:
@@ -37,3 +43,11 @@ jobs:
         with:
           path: state.json
           key: boss-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Start next run
+        # при ручной отмене запуска цепочка останавливается
+        if: (success() || failure()) && github.ref == 'refs/heads/main'
+        run: gh workflow run boss.yml --ref main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
