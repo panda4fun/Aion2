@@ -1,0 +1,39 @@
+name: boss-notifier
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"     # раз в 5 минут (GitHub может задерживать запуск)
+  workflow_dispatch:           # кнопка ручного запуска
+
+concurrency:
+  group: boss-notifier
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: boss-state-${{ github.run_id }}
+          restore-keys: boss-state-
+
+      - name: Run notifier
+        run: python boss_notifier.py
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          MAPS: ${{ vars.MAPS }}
+          ONLY: ${{ vars.ONLY }}
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: boss-state-${{ github.run_id }}-${{ github.run_attempt }}
