@@ -1,12 +1,11 @@
 """
-AION 2 Global, Kromede - уведомления о боссах в Telegram-канал через GitHub Actions.
+AION 2 Global, Kromede - Telegram-бот с таймерами боссов по запросу, работает на GitHub Actions.
 
-Скрипт запускается по расписанию (раз в ~5 минут), читает таймеры NotMeter,
-отправляет уведомления и утреннюю сводку, отвечает на команды бота.
-Что уже отправлено, хранится в state.json (его сохраняет workflow между запусками).
+Каждый запуск ~5,5 минуты читает таймеры NotMeter и отвечает на команды (/bosses, /next).
+Сам в чаты ничего не пишет. Offset команд хранится в state.json (его сохраняет workflow).
 
 Переменные окружения:
-    BOT_TOKEN, CHANNEL_ID  - обязательно (GitHub Secrets)
+    BOT_TOKEN - обязательно (GitHub Secrets)
     MAPS   - локации: 1010 Бертрон, 1110 Альтгард, 20 Решанта (по умолчанию 1110,20)
     ONLY   - коды нужных боссов через запятую (по умолчанию список в коде ниже)
     DRY_RUN=1 - ничего не отправлять, только печатать
@@ -20,7 +19,6 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
 SERVER_ID = 2316                                   # Kromede
 CACHE_URL = ("https://raw.githubusercontent.com/Not4You-Dev/NotMeter-Cache/main/"
@@ -32,22 +30,10 @@ ONLY = {int(x) for x in (os.environ.get("ONLY") or
         "2400800,2400853,2400854,2400855,"                       # Гартуа, Рагт, Кашапа, Тартан
         "2600068,2600089,2600084,2600093,2600094,2600096,2600097,2600098"  # Бездна
         ).split(",") if x.strip()}
-ALERTS = [15, 5]       # за сколько минут предупреждать
-RUN_MINUTES = 5.5      # сколько работает один запуск: ждёт уведомлений и отвечает на команды
+RUN_MINUTES = 5.5      # сколько работает один запуск: отвечает на команды
 CACHE_REFRESH_SEC = 180
 STATE_FILE = "state.json"
 
-# События по серверному времени EU (Europe/Berlin).
-# (ключ, название, первая минута суток, интервал мин (0 = раз в день), дни 0=вс..6=сб, длительность,
-#  за сколько минут уведомлять ([] = не уведомлять))
-EVENTS = [
-    ("rift", "🌀 Пространственно-временной разлом", 120, 180, [0, 1, 2, 3, 4, 5, 6], 10, ALERTS),
-    ("siege", "🏰 Осада артефактов", 1260, 0, [1, 4, 6], 30, ALERTS),
-    ("shugo", "🎪 Фестиваль Шуго", 0, 60, [0, 1, 2, 3, 4, 5, 6], 10, [5]),
-    ("invasion", "🛡 Пространственное вторжение", 30, 60, [0, 1, 2, 3, 4, 5, 6], 15, []),
-]
-RESET_UTC_HOUR = 7          # ежедневный сброс 07:00 UTC (10:00 МСК), еженедельный - в среду
-DIGEST_MAX_DELAY_H = 3      # утреннюю сводку шлём, только если запуск был в течение N ч после сброса
 MSK = ZoneInfo("Europe/Moscow")
 REGION_TZ = ZoneInfo("Europe/Berlin")
 
@@ -149,7 +135,7 @@ def next_scheduled(start, interval, days, after):
 
 
 def collect_targets(cache, now):
-    """код -> ближайшее появление (UTC). Берём и недавно прошедшие, чтобы не пропустить «появился»."""
+    """код -> ближайшее появление (UTC)."""
     since = now
     targets = {}
     server = next((s for s in cache.get("servers", []) if s["serverId"] == SERVER_ID), {})
@@ -172,60 +158,12 @@ def boss_key(code):
     return "|".join(map(str, BOSSES[code]))
 
 
-def collect_items(targets, now):
-    """Всё, о чём уведомляем: (ключ, подпись, время, за сколько минут)."""
-    items, seen = [], set()
-    for code, t in targets.items():
-        if boss_key(code) not in seen:
-            seen.add(boss_key(code))
-            items.append((boss_key(code), label(code), t, ALERTS))
-    for key, name, start, interval, days, _, leads in EVENTS:
-        t = next_scheduled(start, interval, days, now)
-        if leads and t:
-            items.append((f"ev:{key}", name, t, leads))
-    return items
-
-
-def already(state, key, kind, target):
-    ts = state["sent"].get(key, {}).get(kind)
-    return ts is not None and abs(ts - target.timestamp()) < 600   # ±10 мин = то же появление
-
-
-def mark(state, key, kind, target):
-    state["sent"].setdefault(key, {})[kind] = target.timestamp()
-
-
-def alert(state, key, name, target, lead):
-    if already(state, key, f"w{lead}", target):
-        return
-    mins = max(1, round((target - datetime.now(timezone.utc)).total_seconds() / 60))
-    tg("sendMessage", chat_id=CHANNEL_ID,
-       text=f"⏰ Через {mins} мин: {name}\nНачало: {fmt(target)} МСК")
-    for l in ALERTS:            # более ранние уведомления уже не нужны
-        if l >= lead:
-            mark(state, key, f"w{l}", target)
-
-
 def load_cache(now):
     try:
         return http_json(f"{CACHE_URL}?v={int(now.timestamp() // 60)}")
     except Exception as exc:
         print("NotMeter cache error:", exc)
         return {}
-
-
-def build_events(items, now, until):
-    """Моменты уведомлений до конца запуска: (когда, ключ, подпись, время, за сколько минут)."""
-    events = []
-    for key, name, target, leads in items:
-        for lead in leads:
-            moment = target - timedelta(minutes=lead)
-            smaller = max([l for l in leads if l < lead], default=0)
-            # опоздали к моменту: шлём сейчас, если ещё не пора слать следующее уведомление
-            due_now = moment <= now < target - timedelta(minutes=smaller)
-            if due_now or now < moment <= until:
-                events.append((max(moment, now), key, name, target, lead))
-    return sorted(events)
 
 
 def left_txt(t, now):
@@ -235,10 +173,10 @@ def left_txt(t, now):
     return f"{left // 60} ч {left % 60} мин" if left >= 60 else f"{left} мин"
 
 
-def boss_lines(targets, now, limit=None, horizon=None):
+def boss_lines(targets, now, limit=None):
     seen, lines = set(), []
     for code, t in sorted(targets.items(), key=lambda x: x[1]):
-        if t <= now or boss_key(code) in seen or (horizon and t > now + horizon):
+        if t <= now or boss_key(code) in seen:
             continue
         seen.add(boss_key(code))
         lines.append(f"{fmt(t)} (через {left_txt(t, now)}) - {label(code)}")
@@ -250,49 +188,6 @@ def data_head(title, cache):
     if gen:
         title += f"\nДанные NotMeter от {fmt(datetime.fromtimestamp(gen, timezone.utc))}"
     return title
-
-
-def next_reset(now):
-    t = now.replace(hour=RESET_UTC_HOUR, minute=0, second=0, microsecond=0)
-    return t if t > now else t + timedelta(days=1)
-
-
-def events_text(now):
-    lines = ["📅 События AION 2 (Европа, время МСК)", ""]
-    for key, name, start, interval, days, dur, _ in EVENTS:
-        t = next_scheduled(start, interval, days, now - timedelta(minutes=dur))
-        if t and t <= now:
-            lines.append(f"{name} - идёт сейчас (до {fmt(t + timedelta(minutes=dur))})")
-        elif t:
-            lines.append(f"{name} - {fmt(t)} (через {left_txt(t, now)})")
-    r = next_reset(now)
-    w = r
-    while w.weekday() != 2:     # среда
-        w += timedelta(days=1)
-    lines += ["", f"🔄 Ежедневный сброс - {fmt(r)} (через {left_txt(r, now)})",
-              f"📆 Еженедельный сброс - {fmt(w)} (через {left_txt(w, now)})"]
-    return "\n".join(lines)
-
-
-def digest_text(targets, cache, now):
-    day = timedelta(hours=24)
-    lines = [data_head("☀️ Сброс прошёл. План на сутки (МСК)", cache), "", "Боссы:"]
-    lines += boss_lines(targets, now, horizon=day) or ["нет данных"]
-    rifts, siege = [], None
-    for key, name, start, interval, days, _, _ in EVENTS:
-        if key == "rift":
-            t = now
-            while (t := next_scheduled(start, interval, days, t)) and t <= now + day:
-                rifts.append(t.astimezone(MSK).strftime("%H:%M"))
-        if key == "siege":
-            t = next_scheduled(start, interval, days, now)
-            if t and t <= now + day:
-                siege = t
-    lines += ["", "🌀 Разломы: " + ", ".join(rifts)]
-    if siege:
-        lines.append(f"🏰 Осада артефактов: {fmt(siege)}")
-    lines.append("🎪 Шуго - каждый час в :00, 🛡 вторжение - в :30")
-    return "\n".join(lines)
 
 
 def handle_updates(updates, state, targets, cache):
@@ -310,28 +205,12 @@ def handle_updates(updates, state, targets, cache):
         elif cmd == "/next":
             reply = data_head("🗓 Ближайшие боссы (МСК)", cache) + "\n\n" + (
                 "\n".join(boss_lines(targets, now, limit=3)) or "Нет данных")
-        elif cmd == "/events":
-            reply = events_text(now)
-        elif cmd == "/today":
-            reply = digest_text(targets, cache, now)
         elif cmd in ("/start", "/help"):
-            reply = ("Команды:\n/bosses - все таймеры боссов\n/next - ближайшие 3 босса\n"
-                     "/events - события и сбросы\n/today - план на сутки")
+            reply = "Команды:\n/bosses - все таймеры боссов\n/next - ближайшие 3 босса"
         else:
             continue
         tg("sendMessage", chat_id=msg["chat"]["id"], text=reply,
            reply_to_message_id=msg.get("message_id"))
-
-
-def maybe_digest(state, targets, cache, now):
-    last_reset = next_reset(now) - timedelta(days=1)
-    if now - last_reset > timedelta(hours=DIGEST_MAX_DELAY_H):
-        return
-    if state.get("digest") == last_reset.date().isoformat():
-        return
-    tg("sendMessage", chat_id=CHANNEL_ID, text=digest_text(targets, cache, now),
-       disable_notification=True)
-    state["digest"] = last_reset.date().isoformat()
 
 
 def main():
@@ -341,41 +220,28 @@ def main():
         state = json.load(open(STATE_FILE, encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         state = {}
-    state.setdefault("sent", {})
+    # от старой версии с уведомлениями в канал
+    for key in ("sent", "digest", "board_id"):
+        state.pop(key, None)
 
-    # убрать закреплённый список из старой версии бота
-    if state.get("board_id"):
-        tg("unpinChatMessage", chat_id=CHANNEL_ID, message_id=state["board_id"])
-        tg("deleteMessage", chat_id=CHANNEL_ID, message_id=state["board_id"])
-        state.pop("board_id")
-    if state.get("commands_v") != 2:          # меню команд в Telegram
+    if state.get("commands_v") != 3:          # меню команд в Telegram
         tg("setMyCommands", commands=[
             {"command": "bosses", "description": "Все таймеры боссов"},
-            {"command": "next", "description": "Ближайшие 3 босса"},
-            {"command": "events", "description": "События и сбросы"},
-            {"command": "today", "description": "План на сутки"}])
-        state["commands_v"] = 2
+            {"command": "next", "description": "Ближайшие 3 босса"}])
+        state["commands_v"] = 3
 
-    cache, cache_at, targets, events = {}, None, {}, []
+    cache, cache_at, targets = {}, None, {}
     while True:
         now = datetime.now(timezone.utc)
         if cache_at is None or (now - cache_at).total_seconds() >= CACHE_REFRESH_SEC:
             cache, cache_at = load_cache(now), now
             targets = collect_targets(cache, now)
-            events = build_events(collect_items(targets, now), now, deadline)
-            maybe_digest(state, targets, cache, now)
-
-        # отправить уведомления, время которых пришло
-        while events and events[0][0] <= now:
-            _, key, name, target, lead = events.pop(0)
-            alert(state, key, name, target, lead)
         json.dump(state, open(STATE_FILE, "w", encoding="utf-8"))
         if now >= deadline or DRY_RUN:
             break
 
-        # ждём команды до ближайшего события (long polling)
-        until = min([deadline] + [e[0] for e in events[:1]])
-        wait = int(max(1, min(50, (until - now).total_seconds())))
+        # ждём команды (long polling)
+        wait = int(max(1, min(50, (deadline - now).total_seconds())))
         r = tg("getUpdates", http_timeout=wait + 15, timeout=wait,
                offset=state.get("offset"), allowed_updates=["message"])
         if r.get("ok"):
