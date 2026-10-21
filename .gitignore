@@ -1,3 +1,4 @@
 __pycache__/
 cube_overlay/data/
 cube_overlay/state.json
+cube_overlay/overlay.log

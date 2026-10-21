@@ -10,7 +10,8 @@ HEIGHT_WEIGHT = 1.5
 
 
 def dist(a, b):
-    dy = (a["y"] or 0) - (b["y"] or 0)
+    # Высота живой позиции неизвестна: тогда считаем по плоскости.
+    dy = a["y"] - b["y"] if a["y"] is not None and b["y"] is not None else 0
     return math.sqrt((a["x"] - b["x"]) ** 2 + (a["z"] - b["z"]) ** 2 + (HEIGHT_WEIGHT * dy) ** 2)
 
 
