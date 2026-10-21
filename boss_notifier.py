@@ -1,7 +1,8 @@
 """
-AION 2 Global, Kromede - Telegram-бот с таймерами боссов по запросу, работает на GitHub Actions.
+AION 2 Global, Kromede - Telegram-бот с таймерами боссов и событий по запросу, работает на GitHub Actions.
 
-Каждый запуск ~5,5 минуты читает таймеры NotMeter и отвечает на команды (/bosses, /next).
+Каждый запуск ~5,5 минуты читает таймеры NotMeter и отвечает на команды
+(/bosses, /next, /events, /today).
 Сам в чаты ничего не пишет. Offset команд хранится в state.json (его сохраняет workflow).
 
 Переменные окружения:
@@ -34,6 +35,15 @@ RUN_MINUTES = 5.5      # сколько работает один запуск: 
 CACHE_REFRESH_SEC = 180
 STATE_FILE = "state.json"
 
+# События по серверному времени EU (Europe/Berlin).
+# (ключ, название, первая минута суток, интервал мин (0 = раз в день), дни 0=вс..6=сб, длительность)
+EVENTS = [
+    ("rift", "🌀 Пространственно-временной разлом", 120, 180, [0, 1, 2, 3, 4, 5, 6], 10),
+    ("siege", "🏰 Осада артефактов", 1260, 0, [1, 4, 6], 30),
+    ("shugo", "🎪 Фестиваль Шуго", 0, 60, [0, 1, 2, 3, 4, 5, 6], 10),
+    ("invasion", "🛡 Пространственное вторжение", 30, 60, [0, 1, 2, 3, 4, 5, 6], 15),
+]
+RESET_UTC_HOUR = 7          # ежедневный сброс 07:00 UTC (10:00 МСК), еженедельный - в среду
 MSK = ZoneInfo("Europe/Moscow")
 REGION_TZ = ZoneInfo("Europe/Berlin")
 
@@ -173,10 +183,10 @@ def left_txt(t, now):
     return f"{left // 60} ч {left % 60} мин" if left >= 60 else f"{left} мин"
 
 
-def boss_lines(targets, now, limit=None):
+def boss_lines(targets, now, limit=None, horizon=None):
     seen, lines = set(), []
     for code, t in sorted(targets.items(), key=lambda x: x[1]):
-        if t <= now or boss_key(code) in seen:
+        if t <= now or boss_key(code) in seen or (horizon and t > now + horizon):
             continue
         seen.add(boss_key(code))
         lines.append(f"{fmt(t)} (через {left_txt(t, now)}) - {label(code)}")
@@ -188,6 +198,49 @@ def data_head(title, cache):
     if gen:
         title += f"\nДанные NotMeter от {fmt(datetime.fromtimestamp(gen, timezone.utc))}"
     return title
+
+
+def next_reset(now):
+    t = now.replace(hour=RESET_UTC_HOUR, minute=0, second=0, microsecond=0)
+    return t if t > now else t + timedelta(days=1)
+
+
+def events_text(now):
+    lines = ["📅 События AION 2 (Европа, время МСК)", ""]
+    for key, name, start, interval, days, dur in EVENTS:
+        t = next_scheduled(start, interval, days, now - timedelta(minutes=dur))
+        if t and t <= now:
+            lines.append(f"{name} - идёт сейчас (до {fmt(t + timedelta(minutes=dur))})")
+        elif t:
+            lines.append(f"{name} - {fmt(t)} (через {left_txt(t, now)})")
+    r = next_reset(now)
+    w = r
+    while w.weekday() != 2:     # среда
+        w += timedelta(days=1)
+    lines += ["", f"🔄 Ежедневный сброс - {fmt(r)} (через {left_txt(r, now)})",
+              f"📆 Еженедельный сброс - {fmt(w)} (через {left_txt(w, now)})"]
+    return "\n".join(lines)
+
+
+def today_text(targets, cache, now):
+    day = timedelta(hours=24)
+    lines = [data_head("📋 План на сутки (МСК)", cache), "", "Боссы:"]
+    lines += boss_lines(targets, now, horizon=day) or ["нет данных"]
+    rifts, siege = [], None
+    for key, name, start, interval, days, _ in EVENTS:
+        if key == "rift":
+            t = now
+            while (t := next_scheduled(start, interval, days, t)) and t <= now + day:
+                rifts.append(t.astimezone(MSK).strftime("%H:%M"))
+        if key == "siege":
+            t = next_scheduled(start, interval, days, now)
+            if t and t <= now + day:
+                siege = t
+    lines += ["", "🌀 Разломы: " + ", ".join(rifts)]
+    if siege:
+        lines.append(f"🏰 Осада артефактов: {fmt(siege)}")
+    lines.append("🎪 Шуго - каждый час в :00, 🛡 вторжение - в :30")
+    return "\n".join(lines)
 
 
 def handle_updates(updates, state, targets, cache):
@@ -205,8 +258,13 @@ def handle_updates(updates, state, targets, cache):
         elif cmd == "/next":
             reply = data_head("🗓 Ближайшие боссы (МСК)", cache) + "\n\n" + (
                 "\n".join(boss_lines(targets, now, limit=3)) or "Нет данных")
+        elif cmd == "/events":
+            reply = events_text(now)
+        elif cmd == "/today":
+            reply = today_text(targets, cache, now)
         elif cmd in ("/start", "/help"):
-            reply = "Команды:\n/bosses - все таймеры боссов\n/next - ближайшие 3 босса"
+            reply = ("Команды:\n/bosses - все таймеры боссов\n/next - ближайшие 3 босса\n"
+                     "/events - события и сбросы\n/today - план на сутки")
         else:
             continue
         tg("sendMessage", chat_id=msg["chat"]["id"], text=reply,
@@ -224,11 +282,13 @@ def main():
     for key in ("sent", "digest", "board_id"):
         state.pop(key, None)
 
-    if state.get("commands_v") != 3:          # меню команд в Telegram
+    if state.get("commands_v") != 4:          # меню команд в Telegram
         tg("setMyCommands", commands=[
             {"command": "bosses", "description": "Все таймеры боссов"},
-            {"command": "next", "description": "Ближайшие 3 босса"}])
-        state["commands_v"] = 3
+            {"command": "next", "description": "Ближайшие 3 босса"},
+            {"command": "events", "description": "События и сбросы"},
+            {"command": "today", "description": "План на сутки"}])
+        state["commands_v"] = 4
 
     cache, cache_at, targets = {}, None, {}
     while True:
