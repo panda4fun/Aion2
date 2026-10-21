@@ -13,6 +13,7 @@ AION 2 Global, Kromede - уведомления о боссах в Telegram-ка
 """
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -24,11 +25,15 @@ DRY_RUN = os.environ.get("DRY_RUN") == "1"
 SERVER_ID = 2316                                   # Kromede
 CACHE_URL = ("https://raw.githubusercontent.com/Not4You-Dev/NotMeter-Cache/main/"
              "presence/notmeter-field-boss-public-ww-eu-expanded.json")
-MAPS = {int(x) for x in (os.environ.get("MAPS") or "1010,1110,20").split(",") if x.strip()}
-ONLY = {int(x) for x in (os.environ.get("ONLY") or "").split(",") if x.strip()}
-WARN_LEAD_MIN = 20     # предупреждать, когда до появления осталось не больше N минут
-SPAWN_GRACE_MIN = 15   # сообщить «появился», если запуск опоздал не больше чем на N минут
-BOARD_SIZE = 15        # сколько боссов показывать в закреплённом сообщении
+# По умолчанию: вся Бездна + Гартуа, Рагт, Кашапа, Тартан в Альтгарде.
+# GitHub Variables MAPS / ONLY, если заданы, перекрывают эти значения.
+MAPS = {int(x) for x in (os.environ.get("MAPS") or "1110,20").split(",") if x.strip()}
+ONLY = {int(x) for x in (os.environ.get("ONLY") or
+        "2400800,2400853,2400854,2400855,"                       # Гартуа, Рагт, Кашапа, Тартан
+        "2600068,2600089,2600084,2600093,2600094,2600096,2600097,2600098"  # Бездна
+        ).split(",") if x.strip()}
+ALERTS = [15, 5]       # за сколько минут предупреждать
+LOOKAHEAD_MIN = 6      # если момент уведомления наступит в ближайшие N минут - дождаться его
 STATE_FILE = "state.json"
 MSK = ZoneInfo("Europe/Moscow")
 REGION_TZ = ZoneInfo("Europe/Berlin")
@@ -129,7 +134,7 @@ def next_scheduled(start, interval, days, after):
 
 def collect_targets(cache, now):
     """код -> ближайшее появление (UTC). Берём и недавно прошедшие, чтобы не пропустить «появился»."""
-    since = now - timedelta(minutes=SPAWN_GRACE_MIN)
+    since = now
     targets = {}
     server = next((s for s in cache.get("servers", []) if s["serverId"] == SERVER_ID), {})
     for mp in server.get("maps", []):
@@ -146,13 +151,30 @@ def collect_targets(cache, now):
     return targets
 
 
-def already(state, code, kind, target):
-    ts = state["sent"].get(str(code), {}).get(kind)
+def boss_key(code):
+    # у Нахмы три кода на одно появление - считаем их одним боссом
+    return "|".join(map(str, BOSSES[code]))
+
+
+def already(state, key, kind, target):
+    ts = state["sent"].get(key, {}).get(kind)
     return ts is not None and abs(ts - target.timestamp()) < 600   # ±10 мин = тот же респ
 
 
-def mark(state, code, kind, target):
-    state["sent"].setdefault(str(code), {})[kind] = target.timestamp()
+def mark(state, key, kind, target):
+    state["sent"].setdefault(key, {})[kind] = target.timestamp()
+
+
+def alert(state, code, target, lead):
+    key = boss_key(code)
+    if already(state, key, f"w{lead}", target):
+        return
+    mins = max(1, round((target - datetime.now(timezone.utc)).total_seconds() / 60))
+    tg("sendMessage", chat_id=CHANNEL_ID,
+       text=f"⏰ Через {mins} мин: {label(code)}\nПоявление: {fmt(target)} МСК")
+    for l in ALERTS:            # более ранние уведомления уже не нужны
+        if l >= lead:
+            mark(state, key, f"w{l}", target)
 
 
 def main():
@@ -163,44 +185,33 @@ def main():
         state = {}
     state.setdefault("sent", {})
 
+    # убрать закреплённый список из прошлой версии бота
+    if state.get("board_id"):
+        tg("unpinChatMessage", chat_id=CHANNEL_ID, message_id=state["board_id"])
+        tg("deleteMessage", chat_id=CHANNEL_ID, message_id=state["board_id"])
+        state.pop("board_id")
+
     try:
         cache = http_json(f"{CACHE_URL}?v={int(now.timestamp() // 60)}")
     except Exception as exc:
         print("NotMeter cache error:", exc)
         cache = {}
-    targets = collect_targets(cache, now)
 
-    for code, target in sorted(targets.items(), key=lambda x: x[1]):
-        mins = (target - now).total_seconds() / 60
-        if 0 < mins <= WARN_LEAD_MIN and not already(state, code, "warn", target):
-            tg("sendMessage", chat_id=CHANNEL_ID,
-               text=f"⏰ Через {max(1, round(mins))} мин: {label(code)}\nПоявление: {fmt(target)} МСК")
-            mark(state, code, "warn", target)
-        elif -SPAWN_GRACE_MIN <= mins <= 0 and not already(state, code, "spawn", target):
-            tg("sendMessage", chat_id=CHANNEL_ID, text=f"🔥 Появился: {label(code)}")
-            mark(state, code, "spawn", target)
-            mark(state, code, "warn", target)
-
-    # закреплённое сообщение со списком ближайших боссов
-    upcoming = sorted((t, c) for c, t in targets.items() if t > now)[:BOARD_SIZE]
-    gen = cache.get("generatedAt")
-    lines = [f"🗓 Боссы Kromede (обновлено {fmt(now)} МСК)"]
-    if gen:
-        lines.append(f"Данные NotMeter от {fmt(datetime.fromtimestamp(gen, timezone.utc))}")
-    lines.append("")
-    lines += [f"{fmt(t)} - {label(c)}" for t, c in upcoming] or ["Нет данных"]
-    text = "\n".join(lines)
-    board_id = state.get("board_id")
-    ok = False
-    if board_id:
-        r = tg("editMessageText", chat_id=CHANNEL_ID, message_id=board_id, text=text)
-        ok = r.get("ok") or "not modified" in r.get("description", "")
-    if not ok:
-        r = tg("sendMessage", chat_id=CHANNEL_ID, text=text, disable_notification=True)
-        if r.get("ok"):
-            state["board_id"] = r["result"]["message_id"]
-            tg("pinChatMessage", chat_id=CHANNEL_ID, message_id=state["board_id"],
-               disable_notification=True)
+    # моменты уведомлений: (когда, босс, время появления, за сколько минут)
+    events = []
+    for code, target in collect_targets(cache, now).items():
+        for lead in ALERTS:
+            moment = target - timedelta(minutes=lead)
+            smaller = max([l for l in ALERTS if l < lead], default=0)
+            # опоздали к моменту: шлём сейчас, если ещё не пора слать следующее уведомление
+            due_now = moment <= now < target - timedelta(minutes=smaller)
+            if due_now or now < moment <= now + timedelta(minutes=LOOKAHEAD_MIN):
+                events.append((max(moment, now), code, target, lead))
+    for moment, code, target, lead in sorted(events):
+        wait = (moment - datetime.now(timezone.utc)).total_seconds()
+        if wait > 0 and not DRY_RUN:
+            time.sleep(wait)
+        alert(state, code, target, lead)
 
     json.dump(state, open(STATE_FILE, "w", encoding="utf-8"))
 
