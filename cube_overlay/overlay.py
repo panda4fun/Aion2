@@ -31,15 +31,15 @@ LOG_FILE = HERE / "overlay.log"
 MAPS = {"World_D_A": "Altgard", "World_L_A": "Verteron"}
 GAME_EXE = "aion2.exe"
 LOCATE_EVERY = 0.35  # секунд между снимками миникарты
-NEAR_TARGET = 12  # метров: «ты у точки»
+VISIT = 15  # метров: подошёл к точке ближе — она проверена
+ROUTE_LEN = 15  # точек в маршруте: ближайший куб и следующие за ним
+ROUTE_POOL = 40  # из скольких ближайших точек строим маршрут
+JUMP = 300  # метров: такой скачок положения — телепорт, маршрут заново
+SWITCH = 0.6  # другой куб ближе цели в столько раз — переключаемся на него
 
 # Глобальные горячие клавиши: работают, когда в фокусе игра.
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x4000
 HOTKEYS = {
-    "next": (MOD_CONTROL | MOD_ALT, 0x27, "Ctrl+Alt+→", "пусто, дальше"),
-    "found": (MOD_CONTROL | MOD_ALT, 0x26, "Ctrl+Alt+↑", "нашёл куб"),
-    "skip": (MOD_CONTROL | MOD_ALT, 0x28, "Ctrl+Alt+↓", "пропустить"),
-    "undo": (MOD_CONTROL | MOD_ALT, 0x25, "Ctrl+Alt+←", "отменить"),
     "zoom_in": (MOD_CONTROL | MOD_ALT, 0xBB, "Ctrl+Alt+=", "приблизить"),
     "zoom_out": (MOD_CONTROL | MOD_ALT, 0xBD, "Ctrl+Alt+-", "отдалить"),
     "toggle": (MOD_CONTROL | MOD_ALT, 0x48, "Ctrl+Alt+H", "скрыть/показать"),
@@ -178,7 +178,7 @@ class Watcher(threading.Thread):
                     pos = live.step()
                     err = ""
                 except Exception as e:  # noqa: BLE001 — сбой одного кадра не должен останавливать слежение
-                    pos, err = None, f" ошибка: {e!r}"
+                    pos, err = live.loc.pos, f" ошибка: {e!r}"
                 self.out.put(("live", pos, live.loc.mode))
                 self.log(f"игра; ромбов {live.loc.blobs}; режим {live.loc.mode}"
                          f"{'' if pos else '; позиции нет'}{err}")
@@ -251,7 +251,7 @@ class Overlay:
     def ms(self):
         """Состояние текущей карты."""
         return self.st["maps"].setdefault(self.st["map"], {
-            "areas": [], "checked": [], "found": [], "route": [], "pos": 0, "here": None})
+            "route": [], "here": None})
 
     def safe_geometry(self, geo):
         """Не меньше 260x300 и на экране, даже если в state.json что-то не то."""
@@ -279,8 +279,8 @@ class Overlay:
         self.title.pack(side="left", padx=6, pady=3)
         for text, cmd, tip in [("✕", self.quit, "Закрыть"), ("+", lambda: self.zoom(1), "Приблизить"),
                                ("−", lambda: self.zoom(-1), "Отдалить"),
-                               ("⟳", self.rebuild, "Перестроить маршрут от текущей точки"),
-                               ("⚙", self.open_settings, "Районы и настройки")]:
+                               ("⟳", self.replan, "Перестроить маршрут от того места, где ты"),
+                               ("⚙", self.open_settings, "Настройки")]:
             b = tk.Label(head, text=text, bg="#1b222a", fg=FG, font=("Segoe UI", 10), padx=6, cursor="hand2")
             b.pack(side="right")
             b.bind("<Button-1>", lambda e, c=cmd: c())
@@ -308,7 +308,8 @@ class Overlay:
 
         foot = tk.Frame(self.root, bg=BG)
         foot.pack(fill="x")
-        hint = "  ".join(f"{HOTKEYS[k][2]} {HOTKEYS[k][3]}" for k in ("next", "found", "skip", "undo"))
+        hint = (f"Точка считается проверенной, когда подходишь к ней ближе {VISIT} м. "
+                f"{HOTKEYS['toggle'][2]}: {HOTKEYS['toggle'][3]}")
         tk.Label(foot, text=hint, bg=BG, fg=DIM, font=("Segoe UI", 7), wraplength=320,
                  justify="left").pack(side="left", padx=6, pady=(0, 4))
         grip = tk.Label(foot, text="◢", bg=BG, fg=DIM, cursor="size_nw_se")
@@ -317,8 +318,7 @@ class Overlay:
         grip.bind("<B1-Motion>", self.resize)
         grip.bind("<ButtonRelease-1>", lambda e: self.save())
 
-        keys = {"<Right>": "next", "<Up>": "found", "<Down>": "skip", "<Left>": "undo",
-                "<plus>": "zoom_in", "<equal>": "zoom_in", "<minus>": "zoom_out"}
+        keys = {"<plus>": "zoom_in", "<equal>": "zoom_in", "<minus>": "zoom_out"}
         for seq, name in keys.items():
             self.root.bind(seq, lambda e, n=name: self.events.put(n))
 
@@ -345,27 +345,19 @@ class Overlay:
     def set_map(self, key, keep=False):
         self.st["map"] = key
         self.data, self.points = load_map(key)
-        self.areas = {}
-        for g in self.data["groups"]:
-            a = self.areas.setdefault(g["area"], {"name": g["area_name"], "groups": [], "n": 0})
-            a["groups"].append(g["id"])
-            a["n"] += len(g["points"])
         self.marks = {f"lm#{i}": m for i, m in enumerate(self.data["landmarks"])}
         self.relief = tk.PhotoImage(file=str(DATA_DIR / self.data["relief"]["file"]))
         self.live = None
+        # Проверенные точки помним до закрытия оверлея: кубы появляются заново.
+        self.visited = set()
         self.watcher.set_teleports([m for m in self.data["landmarks"] if m["k"] == "teleport"])
         ms = self.ms()
         self.st["zoom"] = max(0, min(len(ZOOMS) - 1, self.st["zoom"]))
-        # Точки могли исчезнуть после обновления данных.
-        ms["route"] = [p for p in ms["route"] if p in self.points]
-        ms["checked"] = [p for p in ms["checked"] if p in self.points]
         if ms["here"] and not self.loc(ms["here"]):
             ms["here"] = None
         if not keep:
             self.pan = [0.0, 0.0]
-        self.history = []
-        self.update_hint()
-        self.refresh()
+        self.replan()
 
     def loc(self, key):
         """Точка куба или ориентир по ключу; ms["here"] бывает и тем, и другим."""
@@ -376,78 +368,60 @@ class Overlay:
         return self.live or self.loc(self.ms()["here"])
 
     def candidates(self):
-        ms = self.ms()
-        areas, checked, found = set(ms["areas"]), set(ms["checked"]), set(ms["found"])
-        return [pid for pid, p in self.points.items()
-                if p["area"] in areas and pid not in checked and p["gid"] not in found]
+        """Все непроверенные точки карты."""
+        return [pid for pid in self.points if pid not in self.visited]
 
-    def rebuild(self, first=None):
-        """Маршрут по непроверенным точкам. first: с какой точки начать."""
+    def nearest_candidate(self, at):
+        cands = self.candidates()
+        return min(cands, key=lambda q: dist(self.points[q], at), default=None)
+
+    def replan(self):
+        """Цель — ближайший к игроку куб, от него маршрут по следующим ближайшим."""
         ms = self.ms()
-        rest = [pid for pid in self.candidates() if pid != first]
-        start = self.points[first] if first else self.start_point()
-        order = build_route([self.points[p] for p in rest], start=start)
-        ms["route"] = ([first] if first else []) + [rest[i] for i in order]
-        ms["pos"] = 0
+        start = self.start_point()
+        first = self.nearest_candidate(start) if start else None
+        if first is None:
+            ms["route"] = []
+        else:
+            f = self.points[first]
+            pool = sorted((q for q in self.candidates() if q != first),
+                          key=lambda q: dist(self.points[q], f))[:ROUTE_POOL]
+            order = build_route([self.points[q] for q in pool], start=f)
+            ms["route"] = [first] + [pool[i] for i in order][:ROUTE_LEN - 1]
         self.pan = [0.0, 0.0]
-        self.history = []
         self.update_hint()
         self.refresh()
 
     def target(self):
-        ms = self.ms()
-        return ms["route"][ms["pos"]] if ms["pos"] < len(ms["route"]) else None
+        route = self.ms()["route"]
+        return route[0] if route else None
 
     def act(self, name):
-        ms = self.ms()
-        pid = self.target()
         if name in ("zoom_in", "zoom_out"):
             return self.zoom(1 if name == "zoom_in" else -1)
         if name == "toggle":
             self.hidden = not self.hidden
             self.show(not self.hidden)
-            return
-        if name == "undo":
-            return self.undo()
-        if pid is None:
-            return
-        if name == "next":
-            self.history.append(("next", pid, ms["here"]))
-            ms["checked"].append(pid)
-            ms["here"] = pid
-            ms["pos"] += 1
-        elif name == "found":
-            gid = self.points[pid]["gid"]
-            tail = ms["route"][ms["pos"] + 1:]
-            dropped = [p for p in tail if self.points[p]["gid"] == gid]
-            self.history.append(("found", pid, ms["here"], list(ms["route"])))
-            ms["checked"].append(pid)
-            ms["found"].append(gid)
-            ms["here"] = pid
-            ms["route"] = ms["route"][:ms["pos"] + 1] + [p for p in tail if p not in dropped]
-            ms["pos"] += 1
-        elif name == "skip":
-            self.history.append(("skip", pid, ms["here"], list(ms["route"])))
-            ms["route"].pop(ms["pos"])
-            ms["route"].append(pid)
-        self.pan = [0.0, 0.0]
-        self.refresh()
 
-    def undo(self):
-        if not self.history:
-            return
-        ms = self.ms()
-        h = self.history.pop()
-        kind, pid, here = h[0], h[1], h[2]
-        if kind in ("next", "found"):
-            ms["checked"].remove(pid)
-            ms["pos"] -= 1
-        if kind == "found":
-            ms["found"].remove(self.points[pid]["gid"])
-        if kind in ("found", "skip"):
-            ms["route"] = h[3]
-        ms["here"] = here
-        self.refresh()
+    def follow(self, prev):
+        """Живое положение обновилось.
+
+        Точки ближе VISIT считаются проверенными. Новая цель — если дошёл до неё,
+        телепортировался или другой куб стал заметно ближе.
+        """
+        pid = self.target()
+        near = {q for q in self.candidates() if dist(self.points[q], self.live) < VISIT}
+        if near:
+            self.visited |= near
+            self.ms()["here"] = min(near, key=lambda q: dist(self.points[q], self.live))
+        if near or prev is None or pid is None or \
+                math.hypot(self.live["x"] - prev["x"], self.live["z"] - prev["z"]) > JUMP:
+            return self.replan()
+        near = self.nearest_candidate(self.live)
+        if near != pid and dist(self.points[near], self.live) < SWITCH * dist(self.points[pid], self.live) - 10:
+            return self.replan()
+        self.update_info()
+        self.draw()
 
     def zoom(self, step):
         self.st["zoom"] = max(0, min(len(ZOOMS) - 1, self.st["zoom"] + step))
@@ -464,31 +438,23 @@ class Overlay:
     def update_info(self):
         ms = self.ms()
         self.title.config(text=f"Hidden Cube · {MAPS[self.st['map']]}")
-        route, pos = ms["route"], ms["pos"]
-        if not ms["areas"]:
-            self.info.config(text="Выбери районы: ⚙")
-            self.sub.config(text="")
-            return
-        if not route:
-            self.info.config(text="Маршрут не построен: ⟳")
-            self.sub.config(text="")
+        route = ms["route"]
+        here = self.start_point()
+        if not here:
+            self.info.config(text="Жду положение персонажа.\nВстань так, чтобы на миникарте игры было "
+                                  "2 телепорта, или кликни здесь по телепорту, у которого стоишь.")
+            self.sub.config(fg=DIM, text=self.live_status())
             return
         pid = self.target()
         if pid is None:
-            self.info.config(text="Маршрут пройден")
-            self.sub.config(text=f"Найдено кубов: {len(ms['found'])}. Новый маршрут: ⟳")
+            self.info.config(text="Непроверенных точек не осталось")
+            self.sub.config(fg=DIM, text="Сбросить проверенные точки: ⚙")
             return
         p = self.points[pid]
-        head = f"{pos + 1}/{len(route)} · {p['area_name']} · {short_group(p['gid'])}"
-        here = self.start_point()
-        if here and here is self.live and dist(here, p) < NEAR_TARGET:
-            line = "Ты у точки: осмотрись и отметь Ctrl+Alt+→ или ↑"
-        elif here:
-            frm = ("от тебя" if here is self.live else
-                   f"от телепорта «{here['n']}»" if "n" in here else "от прошлой точки")
-            line = f"{self.leg(here, p)} {frm}"
-        else:
-            line = "Кликни по телепорту или точке, где стоишь"
+        head = f"Ближайший куб · {p['area_name']} · {short_group(p['gid'])}"
+        frm = ("от тебя" if here is self.live else
+               f"от телепорта «{here['n']}»" if "n" in here else "от прошлой точки")
+        line = f"{self.leg(here, p)} {frm}"
         if p.get("dep"):
             line += f" · под водой {p['dep']:.0f} м"
         elif p["water"]:
@@ -498,9 +464,9 @@ class Overlay:
         hint = (f"\nОриентир: телепорт «{tp['n']}», цель {self.leg(tp, p)} от него"
                 if tp and tp is not here else "")
         self.info.config(text=f"{head}\n{line}{hint}")
-        left = route_length([self.points[q] for q in route[pos:]], list(range(len(route) - pos)), here)
-        self.sub.config(fg=DIM, text=f"{self.live_status()} · осталось ≈{left / 1000:.1f} км · "
-                                     f"проверено {len(ms['checked'])} · найдено кубов {len(ms['found'])}")
+        left = route_length([self.points[q] for q in route], list(range(len(route))), here)
+        self.sub.config(fg=DIM, text=f"{self.live_status()} · маршрут {len(route)} точек ≈{left / 1000:.1f} км · "
+                                     f"проверено {len(self.visited)}")
 
     def live_status(self):
         if self.watcher.error:
@@ -531,7 +497,7 @@ class Overlay:
         if c:
             cx, cz = c["x"], c["z"]
         else:
-            pts = [p for p in self.points.values() if p["area"] in ms["areas"]] or list(self.points.values())
+            pts = list(self.points.values())
             cx = sum(p["x"] for p in pts) / len(pts)
             cz = sum(p["z"] for p in pts) / len(pts)
         return cx + self.pan[0], cz + self.pan[1], ZOOMS[self.st["zoom"]]
@@ -575,18 +541,15 @@ class Overlay:
                 if scale >= 1:
                     cv.create_text(x, y + 6, text=m["n"], fill=col, font=("Segoe UI", 7), anchor="n")
 
-        checked, found = set(ms["checked"]), set(ms["found"])
-        route, pos = ms["route"], ms["pos"]
-        upcoming = route[pos:]
+        upcoming = ms["route"]
         upset = set(upcoming)
-        areas = set(ms["areas"])
         for pid, p in self.points.items():
-            if p["area"] not in areas or pid in upset:
+            if pid in upset:
                 continue
             x, y = S(p["x"], p["z"])
             if not (-5 < x < w + 5 and -5 < y < h + 5):
                 continue
-            if pid in checked or p["gid"] in found:
+            if pid in self.visited:
                 cv.create_oval(x - 3, y - 3, x + 3, y + 3, fill="", outline="#c0c6cc")
             else:
                 cv.create_oval(x - 2, y - 2, x + 2, y + 2, fill=DIM, outline="")
@@ -608,7 +571,7 @@ class Overlay:
             cv.create_oval(x - r, y - r, x + r, y + r, fill=col,
                            outline=C_WATER if p["water"] else "", width=2)
             if i < 10:
-                cv.create_text(x + r + 6, y - r, text=str(pos + i + 1), fill=col, font=("Segoe UI", 8, "bold"))
+                cv.create_text(x + r + 6, y - r, text=str(i + 1), fill=col, font=("Segoe UI", 8, "bold"))
 
         if here is self.live and here:
             x, y = S(here["x"], here["z"])
@@ -645,11 +608,8 @@ class Overlay:
 
     def nearest(self, ex, ey, limit=12):
         """Ближайшая к клику точка куба или ориентир."""
-        areas = set(self.ms()["areas"])
         best, bd = None, limit
         for pid, p in list(self.points.items()) + list(self.marks.items()):
-            if "area" in p and p["area"] not in areas:
-                continue
             x, y = self.to_screen(p["x"], p["z"])
             d = math.hypot(x - ex, y - ey)
             if d < bd:
@@ -675,42 +635,18 @@ class Overlay:
         pid = self.nearest(e.x, e.y)
         if not pid:
             return
-        ms = self.ms()
-        # Клик по телепорту: «я здесь», маршрут от него.
-        if pid in self.marks:
-            ms["here"] = pid
-            self.pin(self.marks[pid])
-            self.rebuild()
-            return
-        # Клик по точке: «я у этой точки», маршрут начинается с неё.
-        if pid in ms["checked"]:
-            ms["checked"].remove(pid)
-        gid = self.points[pid]["gid"]
-        if gid in ms["found"]:
-            ms["found"].remove(gid)
-        self.pin(self.points[pid])
-        self.rebuild(first=pid)
+        # Клик по телепорту или точке: «я здесь», маршрут от этого места.
+        self.ms()["here"] = pid
+        self.pin(self.loc(pid))
+        self.replan()
 
     def canvas_right(self, e):
-        """Правый клик: отметить точку проверенной или снять отметку."""
+        """Правый клик: точка проверена / снова не проверена (если отметилась не та)."""
         pid = self.nearest(e.x, e.y)
         if not pid or pid in self.marks:
             return
-        ms = self.ms()
-        if pid in ms["checked"]:
-            ms["checked"].remove(pid)
-            if self.target():
-                self.rebuild(first=self.target())
-            else:
-                self.rebuild()
-            return
-        ms["checked"].append(pid)
-        if pid in ms["route"]:
-            i = ms["route"].index(pid)
-            ms["route"].pop(i)
-            if i < ms["pos"]:
-                ms["pos"] -= 1
-        self.refresh()
+        self.visited ^= {pid}
+        self.replan()
 
     # --- настройки ---------------------------------------------------------
 
@@ -719,7 +655,7 @@ class Overlay:
             self.win.lift()
             return
         win = self.win = tk.Toplevel(self.root)
-        win.title("Hidden Cube: районы")
+        win.title("Hidden Cube: настройки")
         win.attributes("-topmost", True)
         win.geometry(f"+{self.root.winfo_x() + 40}+{self.root.winfo_y() + 40}")
 
@@ -730,26 +666,12 @@ class Overlay:
         box = ttk.Combobox(top, textvariable=mapvar, values=list(MAPS.values()), state="readonly", width=16)
         box.grid(row=0, column=1, sticky="w", pady=(0, 6))
 
-        ttk.Label(top, text="Районы (можно несколько, Ctrl/Shift+клик):").grid(row=1, column=0, columnspan=2, sticky="w")
-        lb = tk.Listbox(top, selectmode="extended", width=48, height=18, exportselection=False)
-        lb.grid(row=2, column=0, columnspan=2, sticky="nsew")
-        top.rowconfigure(2, weight=1)
         top.columnconfigure(1, weight=1)
+        stats = ttk.Label(top)
+        stats.grid(row=1, column=0, columnspan=2, sticky="w")
 
         def fill():
-            lb.delete(0, "end")
-            ms = self.ms()
-            checked, found = set(ms["checked"]), set(ms["found"])
-            self.order = sorted(self.areas, key=lambda a: self.areas[a]["name"])
-            for i, a in enumerate(self.order):
-                info = self.areas[a]
-                done = sum(1 for pid, p in self.points.items() if p["area"] == a and pid in checked)
-                nf = sum(1 for g in info["groups"] if g in found)
-                water = " · вода" if "water" in a.lower() else ""
-                lb.insert("end", f"{info['name']}{water} — точек {info['n']}, кубов {len(info['groups'])}"
-                                 + (f" · проверено {done}, найдено {nf}" if done or nf else ""))
-                if a in ms["areas"]:
-                    lb.selection_set(i)
+            stats.config(text=f"Точек на карте {len(self.points)}, проверено {len(self.visited)}")
 
         def on_map(_):
             key = next(k for k, v in MAPS.items() if v == mapvar.get())
@@ -760,28 +682,14 @@ class Overlay:
         box.bind("<<ComboboxSelected>>", on_map)
         fill()
 
-        def apply():
-            ms = self.ms()
-            ms["areas"] = [self.order[i] for i in lb.curselection()]
-            ms["here"] = None
-            self.rebuild()
-            fill()
-
-        def reset(areas_only):
-            ms = self.ms()
-            sel = {self.order[i] for i in lb.curselection()} if areas_only else set(self.areas)
-            ms["checked"] = [p for p in ms["checked"] if self.points[p]["area"] not in sel]
-            ms["found"] = [g for g in ms["found"]
-                           if not any(g in self.areas[a]["groups"] for a in sel)]
-            ms["here"] = None
-            self.rebuild()
+        def reset():
+            self.visited = set()
+            self.replan()
             fill()
 
         btns = ttk.Frame(top)
         btns.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        ttk.Button(btns, text="Построить маршрут", command=apply).pack(side="left")
-        ttk.Button(btns, text="Сбросить отметки в выбранных", command=lambda: reset(True)).pack(side="left", padx=6)
-        ttk.Button(btns, text="Сбросить всё", command=lambda: reset(False)).pack(side="left")
+        ttk.Button(btns, text="Сбросить проверенные точки (кубы появились заново)", command=reset).pack(side="left")
 
         al = ttk.Frame(top)
         al.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
@@ -804,9 +712,11 @@ class Overlay:
                         command=on_hide).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         help_text = ("Положение определяется само по миникарте игры, когда на ней видны телепорты.\n"
+                     "Цель — ближайший к тебе непроверенный куб, маршрут идёт от него.\n"
+                     f"Точка считается проверенной, когда подходишь к ней ближе {VISIT} м.\n"
+                     "Проверенные точки помнятся, пока оверлей открыт.\n"
                      "Кнопка ⟳: перестроить маршрут от того места, где ты сейчас.\n"
-                     "Клик по телепорту (голубой ромб): «я здесь», маршрут строится от него.\n"
-                     "Клик по точке на миникарте: начать маршрут с неё. Правый клик: отметить или снять.\n"
+                     "Клик по телепорту или точке: «я здесь». Правый клик по точке: снять или поставить отметку.\n"
                      "Перетаскивание: сдвинуть карту, колесо: масштаб.\n"
                      + "\n".join(f"{v[2]}: {v[3]}" for v in HOTKEYS.values()))
         ttk.Label(top, text=help_text, foreground="#555").grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
@@ -836,21 +746,13 @@ class Overlay:
                 self.show(ev[1] is not None)
         elif ev[0] == "live":
             pos, self.live_mode = ev[1], ev[2]
-            found = pos and not self.live
+            prev = self.live
             self.live = {"x": pos[0], "z": pos[1], "y": None} if pos else None
-            if found:
-                self.on_found()
+            if self.live:
+                self.follow(prev)
             else:
                 self.update_info()
                 self.draw()
-
-    def on_found(self):
-        """Положение только что нашлось: маршрут от игрока, при пустом выборе — ближайший район."""
-        ms = self.ms()
-        if not ms["areas"]:
-            near = min(self.points.values(), key=lambda p: dist(p, self.live))
-            ms["areas"] = [near["area"]]
-        self.rebuild()
 
     def update_hint(self):
         """Подсказка локатору, где искать игрока, пока его положение неизвестно."""
@@ -881,8 +783,6 @@ class Overlay:
         self.root.destroy()
 
     def run(self):
-        if not self.ms()["areas"]:
-            self.root.after(200, self.open_settings)
         self.root.mainloop()
 
 

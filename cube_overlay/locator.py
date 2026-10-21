@@ -43,12 +43,28 @@ class ScreenGrab:
     """Снимок прямоугольника экрана через GDI в массив (h, w, 3) RGB."""
 
     def __init__(self):
-        self.u = ctypes.windll.user32
-        self.g = ctypes.windll.gdi32
-        self.u.GetDC.restype = wintypes.HDC
-        self.g.CreateCompatibleDC.restype = wintypes.HDC
-        self.g.CreateCompatibleBitmap.restype = wintypes.HBITMAP
-        self.g.SelectObject.restype = wintypes.HGDIOBJ
+        # Свои экземпляры DLL с полными сигнатурами: без argtypes ctypes передаёт
+        # 64-битные дескрипторы как int и падает с OverflowError на больших значениях.
+        self.u = ctypes.WinDLL("user32")
+        self.g = ctypes.WinDLL("gdi32")
+        H, DC = wintypes.HANDLE, wintypes.HDC
+        sig = {
+            (self.u, "GetDC"): (DC, [wintypes.HWND]),
+            (self.u, "ReleaseDC"): (ctypes.c_int, [wintypes.HWND, DC]),
+            (self.u, "GetSystemMetrics"): (ctypes.c_int, [ctypes.c_int]),
+            (self.g, "CreateCompatibleDC"): (DC, [DC]),
+            (self.g, "CreateCompatibleBitmap"): (wintypes.HBITMAP, [DC, ctypes.c_int, ctypes.c_int]),
+            (self.g, "SelectObject"): (H, [DC, H]),
+            (self.g, "BitBlt"): (wintypes.BOOL, [DC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                                 DC, ctypes.c_int, ctypes.c_int, wintypes.DWORD]),
+            (self.g, "GetDIBits"): (ctypes.c_int, [DC, wintypes.HBITMAP, wintypes.UINT, wintypes.UINT,
+                                                   ctypes.c_void_p, ctypes.c_void_p, wintypes.UINT]),
+            (self.g, "DeleteObject"): (wintypes.BOOL, [H]),
+            (self.g, "DeleteDC"): (wintypes.BOOL, [DC]),
+        }
+        for (dll, name), (res, args) in sig.items():
+            f = getattr(dll, name)
+            f.restype, f.argtypes = res, args
 
     def screen_size(self):
         return self.u.GetSystemMetrics(0), self.u.GetSystemMetrics(1)
