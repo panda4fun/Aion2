@@ -53,3 +53,7 @@ DRY_RUN=1 python boss_notifier.py
 ```
 
 С `DRY_RUN=1` скрипт ничего не отправляет, только печатает сообщения и делает один проход.
+
+## Hidden Cube Overlay
+
+Отдельная утилита в папке [cube_overlay](cube_overlay/README.md): оверлей поверх игры с маршрутом по точкам Hidden Cube.
