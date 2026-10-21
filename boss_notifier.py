@@ -33,7 +33,8 @@ ONLY = {int(x) for x in (os.environ.get("ONLY") or
         "2600068,2600089,2600084,2600093,2600094,2600096,2600097,2600098"  # Бездна
         ).split(",") if x.strip()}
 ALERTS = [15, 5]       # за сколько минут предупреждать
-LOOKAHEAD_MIN = 6      # если момент уведомления наступит в ближайшие N минут - дождаться его
+RUN_MINUTES = 5.5      # сколько работает один запуск: ждёт уведомлений и отвечает на команды
+CACHE_REFRESH_SEC = 180
 STATE_FILE = "state.json"
 MSK = ZoneInfo("Europe/Moscow")
 REGION_TZ = ZoneInfo("Europe/Berlin")
@@ -99,24 +100,27 @@ def fmt(dt):
     return f"{DAYS[d.weekday()]} {d:%H:%M}"
 
 
-def http_json(url, payload=None):
+def http_json(url, payload=None, timeout=20):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, headers={
         "User-Agent": "aion2-boss-tg-bot", "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=20) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
 
 
-def tg(method, **params):
-    if DRY_RUN:
+def tg(method, http_timeout=20, **params):
+    if DRY_RUN and method != "getUpdates":
         print(f"[{method}]", params.get("text", params))
         return {"ok": True, "result": {"message_id": 1}}
     try:
-        return http_json(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", params)
+        return http_json(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", params, http_timeout)
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="ignore")
         print(f"Telegram {method} error {e.code}: {body}")
         return {"ok": False, "description": body}
+    except Exception as e:
+        print(f"Telegram {method} error: {e}")
+        return {"ok": False, "description": str(e)}
 
 
 def next_scheduled(start, interval, days, after):
@@ -177,43 +181,112 @@ def alert(state, code, target, lead):
             mark(state, key, f"w{l}", target)
 
 
-def main():
+def load_cache(now):
+    try:
+        return http_json(f"{CACHE_URL}?v={int(now.timestamp() // 60)}")
+    except Exception as exc:
+        print("NotMeter cache error:", exc)
+        return {}
+
+
+def build_events(targets, now, until):
+    """Моменты уведомлений до конца запуска: (когда, код, время появления, за сколько минут)."""
+    events = []
+    for code, target in targets.items():
+        for lead in ALERTS:
+            moment = target - timedelta(minutes=lead)
+            smaller = max([l for l in ALERTS if l < lead], default=0)
+            # опоздали к моменту: шлём сейчас, если ещё не пора слать следующее уведомление
+            due_now = moment <= now < target - timedelta(minutes=smaller)
+            if due_now or now < moment <= until:
+                events.append((max(moment, now), code, target, lead))
+    return sorted(events)
+
+
+def boss_list(targets, cache, limit=None):
     now = datetime.now(timezone.utc)
+    seen, lines = set(), []
+    for code, t in sorted(targets.items(), key=lambda x: x[1]):
+        if t <= now or boss_key(code) in seen:
+            continue
+        seen.add(boss_key(code))
+        left = int((t - now).total_seconds() // 60)
+        left_txt = f"{left // 60} ч {left % 60} мин" if left >= 60 else f"{left} мин"
+        lines.append(f"{fmt(t)} (через {left_txt}) - {label(code)}")
+    if limit:
+        lines = lines[:limit]
+    gen = cache.get("generatedAt")
+    head = "🗓 Таймеры боссов Kromede (МСК)"
+    if gen:
+        head += f"\nДанные NotMeter от {fmt(datetime.fromtimestamp(gen, timezone.utc))}"
+    return head + "\n\n" + ("\n".join(lines) or "Нет данных")
+
+
+def handle_updates(updates, state, targets, cache):
+    for u in updates:
+        state["offset"] = u["update_id"] + 1
+        msg = u.get("message") or u.get("channel_post") or {}
+        text = (msg.get("text") or "").strip()
+        if not text.startswith("/"):
+            continue
+        cmd = text.split()[0].split("@")[0].lower()
+        if cmd in ("/bosses", "/timers", "/boss"):
+            reply = boss_list(targets, cache)
+        elif cmd == "/next":
+            reply = boss_list(targets, cache, limit=3)
+        elif cmd in ("/start", "/help"):
+            reply = "Команды:\n/bosses - все таймеры\n/next - ближайшие 3 босса"
+        else:
+            continue
+        tg("sendMessage", chat_id=msg["chat"]["id"], text=reply,
+           reply_to_message_id=msg.get("message_id"))
+
+
+def main():
+    started = datetime.now(timezone.utc)
+    deadline = started + timedelta(minutes=RUN_MINUTES)
     try:
         state = json.load(open(STATE_FILE, encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         state = {}
     state.setdefault("sent", {})
 
-    # убрать закреплённый список из прошлой версии бота
+    # убрать закреплённый список из старой версии бота
     if state.get("board_id"):
         tg("unpinChatMessage", chat_id=CHANNEL_ID, message_id=state["board_id"])
         tg("deleteMessage", chat_id=CHANNEL_ID, message_id=state["board_id"])
         state.pop("board_id")
+    if state.get("commands_v") != 1:          # меню команд в Telegram
+        tg("setMyCommands", commands=[
+            {"command": "bosses", "description": "Все таймеры боссов"},
+            {"command": "next", "description": "Ближайшие 3 босса"}])
+        state["commands_v"] = 1
 
-    try:
-        cache = http_json(f"{CACHE_URL}?v={int(now.timestamp() // 60)}")
-    except Exception as exc:
-        print("NotMeter cache error:", exc)
-        cache = {}
+    cache, cache_at, targets, events = {}, None, {}, []
+    while True:
+        now = datetime.now(timezone.utc)
+        if cache_at is None or (now - cache_at).total_seconds() >= CACHE_REFRESH_SEC:
+            cache, cache_at = load_cache(now), now
+            targets = collect_targets(cache, now)
+            events = build_events(targets, now, deadline)
 
-    # моменты уведомлений: (когда, босс, время появления, за сколько минут)
-    events = []
-    for code, target in collect_targets(cache, now).items():
-        for lead in ALERTS:
-            moment = target - timedelta(minutes=lead)
-            smaller = max([l for l in ALERTS if l < lead], default=0)
-            # опоздали к моменту: шлём сейчас, если ещё не пора слать следующее уведомление
-            due_now = moment <= now < target - timedelta(minutes=smaller)
-            if due_now or now < moment <= now + timedelta(minutes=LOOKAHEAD_MIN):
-                events.append((max(moment, now), code, target, lead))
-    for moment, code, target, lead in sorted(events):
-        wait = (moment - datetime.now(timezone.utc)).total_seconds()
-        if wait > 0 and not DRY_RUN:
-            time.sleep(wait)
-        alert(state, code, target, lead)
+        # отправить уведомления, время которых пришло
+        while events and events[0][0] <= now:
+            _, code, target, lead = events.pop(0)
+            alert(state, code, target, lead)
+        json.dump(state, open(STATE_FILE, "w", encoding="utf-8"))
+        if now >= deadline or DRY_RUN:
+            break
 
-    json.dump(state, open(STATE_FILE, "w", encoding="utf-8"))
+        # ждём команды до ближайшего события (long polling)
+        until = min([deadline] + [e[0] for e in events[:1]])
+        wait = int(max(1, min(50, (until - now).total_seconds())))
+        r = tg("getUpdates", http_timeout=wait + 15, timeout=wait,
+               offset=state.get("offset"), allowed_updates=["message"])
+        if r.get("ok"):
+            handle_updates(r["result"], state, targets, cache)
+        else:
+            time.sleep(min(wait, 10))
 
 
 if __name__ == "__main__":
