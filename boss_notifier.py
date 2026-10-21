@@ -2,13 +2,13 @@
 AION 2 Global, Kromede - уведомления о боссах в Telegram-канал через GitHub Actions.
 
 Скрипт запускается по расписанию (раз в ~5 минут), читает таймеры NotMeter,
-отправляет уведомления и обновляет закреплённое сообщение со списком боссов.
+отправляет уведомления и утреннюю сводку, отвечает на команды бота.
 Что уже отправлено, хранится в state.json (его сохраняет workflow между запусками).
 
 Переменные окружения:
     BOT_TOKEN, CHANNEL_ID  - обязательно (GitHub Secrets)
-    MAPS   - локации: 1010 Бертрон, 1110 Альтгард, 20 Решанта (по умолчанию все)
-    ONLY   - коды нужных боссов через запятую (по умолчанию все)
+    MAPS   - локации: 1010 Бертрон, 1110 Альтгард, 20 Решанта (по умолчанию 1110,20)
+    ONLY   - коды нужных боссов через запятую (по умолчанию список в коде ниже)
     DRY_RUN=1 - ничего не отправлять, только печатать
 """
 import json
@@ -38,12 +38,13 @@ CACHE_REFRESH_SEC = 180
 STATE_FILE = "state.json"
 
 # События по серверному времени EU (Europe/Berlin).
-# (ключ, название, первая минута суток, интервал мин (0 = раз в день), дни 0=вс..6=сб, длительность, уведомлять)
+# (ключ, название, первая минута суток, интервал мин (0 = раз в день), дни 0=вс..6=сб, длительность,
+#  за сколько минут уведомлять ([] = не уведомлять))
 EVENTS = [
-    ("rift", "🌀 Пространственно-временной разлом", 120, 180, [0, 1, 2, 3, 4, 5, 6], 10, True),
-    ("siege", "🏰 Осада артефактов", 1260, 0, [1, 4, 6], 30, True),
-    ("shugo", "🎪 Фестиваль Шуго", 0, 60, [0, 1, 2, 3, 4, 5, 6], 10, False),
-    ("invasion", "🛡 Пространственное вторжение", 30, 60, [0, 1, 2, 3, 4, 5, 6], 15, False),
+    ("rift", "🌀 Пространственно-временной разлом", 120, 180, [0, 1, 2, 3, 4, 5, 6], 10, ALERTS),
+    ("siege", "🏰 Осада артефактов", 1260, 0, [1, 4, 6], 30, ALERTS),
+    ("shugo", "🎪 Фестиваль Шуго", 0, 60, [0, 1, 2, 3, 4, 5, 6], 10, [5]),
+    ("invasion", "🛡 Пространственное вторжение", 30, 60, [0, 1, 2, 3, 4, 5, 6], 15, []),
 ]
 RESET_UTC_HOUR = 7          # ежедневный сброс 07:00 UTC (10:00 МСК), еженедельный - в среду
 DIGEST_MAX_DELAY_H = 3      # утреннюю сводку шлём, только если запуск был в течение N ч после сброса
@@ -172,16 +173,16 @@ def boss_key(code):
 
 
 def collect_items(targets, now):
-    """Всё, о чём уведомляем: (ключ, подпись, время)."""
+    """Всё, о чём уведомляем: (ключ, подпись, время, за сколько минут)."""
     items, seen = [], set()
     for code, t in targets.items():
         if boss_key(code) not in seen:
             seen.add(boss_key(code))
-            items.append((boss_key(code), label(code), t))
-    for key, name, start, interval, days, _, notify in EVENTS:
+            items.append((boss_key(code), label(code), t, ALERTS))
+    for key, name, start, interval, days, _, leads in EVENTS:
         t = next_scheduled(start, interval, days, now)
-        if notify and t:
-            items.append((f"ev:{key}", name, t))
+        if leads and t:
+            items.append((f"ev:{key}", name, t, leads))
     return items
 
 
@@ -216,10 +217,10 @@ def load_cache(now):
 def build_events(items, now, until):
     """Моменты уведомлений до конца запуска: (когда, ключ, подпись, время, за сколько минут)."""
     events = []
-    for key, name, target in items:
-        for lead in ALERTS:
+    for key, name, target, leads in items:
+        for lead in leads:
             moment = target - timedelta(minutes=lead)
-            smaller = max([l for l in ALERTS if l < lead], default=0)
+            smaller = max([l for l in leads if l < lead], default=0)
             # опоздали к моменту: шлём сейчас, если ещё не пора слать следующее уведомление
             due_now = moment <= now < target - timedelta(minutes=smaller)
             if due_now or now < moment <= until:
