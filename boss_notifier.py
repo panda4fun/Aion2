@@ -33,6 +33,7 @@ ONLY = {int(x) for x in (os.environ.get("ONLY") or
         ).split(",") if x.strip()}
 RUN_MINUTES = 5.5      # сколько работает один запуск: отвечает на команды
 CACHE_REFRESH_SEC = 180
+DUE_WINDOW_MIN = 60    # сколько показывать босса, чей таймер прошёл, а NotMeter ещё не обновился
 STATE_FILE = "state.json"
 
 # События по серверному времени EU (Europe/Berlin).
@@ -145,22 +146,26 @@ def next_scheduled(start, interval, days, after):
 
 
 def collect_targets(cache, now):
-    """код -> ближайшее появление (UTC)."""
+    """(код -> ближайшее появление (UTC), коды боссов, которые живы сейчас)."""
     since = now
-    targets = {}
+    targets, alive = {}, set()
     server = next((s for s in cache.get("servers", []) if s["serverId"] == SERVER_ID), {})
     for mp in server.get("maps", []):
         for e in mp["entries"]:
             code = e["bossCode"]
             t = datetime.fromtimestamp(e["targetAt"] / 1000, timezone.utc)
-            if wanted(code) and t > since:
+            if not wanted(code):
+                continue
+            if e.get("spawned"):        # NotMeter видит босса живым, targetAt = время наблюдения
+                alive.add(code)
+            elif t > since - timedelta(minutes=DUE_WINDOW_MIN):
                 targets[code] = t
     for code, start, interval, days in SCHEDULED:
-        if wanted(code) and code not in targets:
+        if wanted(code) and code not in targets and code not in alive:
             t = next_scheduled(start, interval, days, since)
             if t:
                 targets[code] = t
-    return targets
+    return targets, alive
 
 
 def boss_key(code):
@@ -183,14 +188,24 @@ def left_txt(t, now):
     return f"{left // 60} ч {left % 60} мин" if left >= 60 else f"{left} мин"
 
 
-def boss_lines(targets, now, limit=None, horizon=None):
-    seen, lines = set(), []
+def boss_lines(targets, alive, now, limit=None, horizon=None):
+    """Сначала живые боссы, потом ближайшие появления (limit - только на появления)."""
+    seen, alive_lines, lines = set(), [], []
+    for code in sorted(alive, key=label):
+        if boss_key(code) not in seen:
+            seen.add(boss_key(code))
+            alive_lines.append(f"🟢 жив сейчас - {label(code)}")
+    for code, t in sorted(targets.items(), key=lambda x: x[1]):
+        if t <= now and boss_key(code) not in seen:
+            # таймер прошёл, а NotMeter ещё не отметил - скорее всего, босс жив
+            seen.add(boss_key(code))
+            alive_lines.append(f"🟡 должен был появиться в {fmt(t)} - {label(code)}")
     for code, t in sorted(targets.items(), key=lambda x: x[1]):
         if t <= now or boss_key(code) in seen or (horizon and t > now + horizon):
             continue
         seen.add(boss_key(code))
         lines.append(f"{fmt(t)} (через {left_txt(t, now)}) - {label(code)}")
-    return lines[:limit] if limit else lines
+    return alive_lines + (lines[:limit] if limit else lines)
 
 
 def data_head(title, cache):
@@ -222,10 +237,10 @@ def events_text(now):
     return "\n".join(lines)
 
 
-def today_text(targets, cache, now):
+def today_text(targets, alive, cache, now):
     day = timedelta(hours=24)
     lines = [data_head("📋 План на сутки (МСК)", cache), "", "Боссы:"]
-    lines += boss_lines(targets, now, horizon=day) or ["нет данных"]
+    lines += boss_lines(targets, alive, now, horizon=day) or ["нет данных"]
     rifts, siege = [], None
     for key, name, start, interval, days, _ in EVENTS:
         if key == "rift":
@@ -243,7 +258,7 @@ def today_text(targets, cache, now):
     return "\n".join(lines)
 
 
-def handle_updates(updates, state, targets, cache):
+def handle_updates(updates, state, targets, alive, cache):
     now = datetime.now(timezone.utc)
     for u in updates:
         state["offset"] = u["update_id"] + 1
@@ -254,14 +269,14 @@ def handle_updates(updates, state, targets, cache):
         cmd = text.split()[0].split("@")[0].lower()
         if cmd in ("/bosses", "/timers", "/boss"):
             reply = data_head("🗓 Таймеры боссов Kromede (МСК)", cache) + "\n\n" + (
-                "\n".join(boss_lines(targets, now)) or "Нет данных")
+                "\n".join(boss_lines(targets, alive, now)) or "Нет данных")
         elif cmd == "/next":
             reply = data_head("🗓 Ближайшие боссы (МСК)", cache) + "\n\n" + (
-                "\n".join(boss_lines(targets, now, limit=3)) or "Нет данных")
+                "\n".join(boss_lines(targets, alive, now, limit=3)) or "Нет данных")
         elif cmd == "/events":
             reply = events_text(now)
         elif cmd == "/today":
-            reply = today_text(targets, cache, now)
+            reply = today_text(targets, alive, cache, now)
         elif cmd in ("/start", "/help"):
             reply = ("Команды:\n/bosses - все таймеры боссов\n/next - ближайшие 3 босса\n"
                      "/events - события и сбросы\n/today - план на сутки")
@@ -290,12 +305,12 @@ def main():
             {"command": "today", "description": "План на сутки"}])
         state["commands_v"] = 4
 
-    cache, cache_at, targets = {}, None, {}
+    cache, cache_at, targets, alive = {}, None, {}, set()
     while True:
         now = datetime.now(timezone.utc)
         if cache_at is None or (now - cache_at).total_seconds() >= CACHE_REFRESH_SEC:
             cache, cache_at = load_cache(now), now
-            targets = collect_targets(cache, now)
+            targets, alive = collect_targets(cache, now)
         json.dump(state, open(STATE_FILE, "w", encoding="utf-8"))
         if now >= deadline or DRY_RUN:
             break
@@ -305,7 +320,7 @@ def main():
         r = tg("getUpdates", http_timeout=wait + 15, timeout=wait,
                offset=state.get("offset"), allowed_updates=["message"])
         if r.get("ok"):
-            handle_updates(r["result"], state, targets, cache)
+            handle_updates(r["result"], state, targets, alive, cache)
         else:
             time.sleep(min(wait, 10))
 
